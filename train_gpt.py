@@ -86,8 +86,15 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Random-adapter (port of MLX experiments E001/E003/E006/E007/E008).
+    # 0 = disabled. Component-specific values override the global rank when nonzero.
+    random_adapter_rank = int(os.environ.get("RANDOM_ADAPTER_RANK", 0))
+    random_adapter_attn_rank = int(os.environ.get("RANDOM_ADAPTER_ATTN_RANK", 0))
+    random_adapter_mlp_rank = int(os.environ.get("RANDOM_ADAPTER_MLP_RANK", 0))
+    random_adapter_seed_base = int(os.environ.get("RANDOM_ADAPTER_SEED_BASE", 7919))
+
 # -----------------------------
-# MUON OPTIMIZER 
+# MUON OPTIMIZER
 # -----------------------------
 # 
 # As borrowed from modded-nanogpt
@@ -513,6 +520,40 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class RandomAdapterLinear(nn.Module):
+    # Frozen random base regenerated from a seed plus a trainable low-rank adapter U @ V^T.
+    # Forward: x @ (W_random + V @ U).T. Only U, V are stored/learned; W_random is a
+    # non-persistent buffer (not in state_dict) regenerated deterministically on the
+    # active device. The seed is a config int and costs ~zero artifact bytes.
+    def __init__(self, in_dim: int, out_dim: int, seed: int, rank: int):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.seed = int(seed)
+        self.rank = int(rank)
+        # LoRA-style init: V ~ N(0, 1/in_dim), U = 0 → forward at step 0 equals random base alone.
+        v_init = torch.randn(in_dim, rank) * (in_dim ** -0.5)
+        self.V = nn.Parameter(v_init)
+        self.U = nn.Parameter(torch.zeros(rank, out_dim))
+        # Deterministically generate the random base on CPU; .to(device) will move it.
+        g = torch.Generator(device="cpu").manual_seed(self.seed)
+        w_rand = torch.randn(out_dim, in_dim, generator=g) * (in_dim ** -0.5)
+        # persistent=False: not saved in state_dict, so it doesn't count toward the artifact.
+        self.register_buffer("W_rand", w_rand, persistent=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        W_rand = self.W_rand.to(x.dtype)
+        rand_path = x @ W_rand.t()
+        adapter_path = (x @ self.V.to(x.dtype)) @ self.U.to(x.dtype)
+        return rand_path + adapter_path
+
+
+def _maybe_random_adapter(in_dim: int, out_dim: int, seed: int, rank: int) -> nn.Module:
+    if rank > 0:
+        return RandomAdapterLinear(in_dim, out_dim, seed=seed, rank=rank)
+    return CastedLinear(in_dim, out_dim, bias=False)
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -560,6 +601,8 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        ra_rank: int = 0,
+        ra_seed_base: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -572,11 +615,13 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
+        self.c_q = _maybe_random_adapter(dim, dim, seed=ra_seed_base + 0, rank=ra_rank)
+        self.c_k = _maybe_random_adapter(dim, kv_dim, seed=ra_seed_base + 1, rank=ra_rank)
+        self.c_v = _maybe_random_adapter(dim, kv_dim, seed=ra_seed_base + 2, rank=ra_rank)
+        self.proj = _maybe_random_adapter(dim, dim, seed=ra_seed_base + 3, rank=ra_rank)
+        if isinstance(self.proj, CastedLinear):
+            self.proj._zero_init = True
+        # For RandomAdapterLinear, U=0 init already gives the same starting behaviour.
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
@@ -605,12 +650,13 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, ra_rank: int = 0, ra_seed_base: int = 0):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        self.fc = _maybe_random_adapter(dim, hidden, seed=ra_seed_base + 4, rank=ra_rank)
+        self.proj = _maybe_random_adapter(hidden, dim, seed=ra_seed_base + 5, rank=ra_rank)
+        if isinstance(self.proj, CastedLinear):
+            self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
@@ -626,12 +672,18 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        ra_attn_rank: int = 0,
+        ra_mlp_rank: int = 0,
+        ra_seed_base: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(
+            dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+            ra_rank=ra_attn_rank, ra_seed_base=ra_seed_base,
+        )
+        self.mlp = MLP(dim, mlp_mult, ra_rank=ra_mlp_rank, ra_seed_base=ra_seed_base)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -659,6 +711,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        ra_attn_rank: int = 0,
+        ra_mlp_rank: int = 0,
+        ra_seed_base: int = 7919,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -680,6 +735,9 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    ra_attn_rank=ra_attn_rank,
+                    ra_mlp_rank=ra_mlp_rank,
+                    ra_seed_base=ra_seed_base + i * 8,
                 )
                 for i in range(num_layers)
             ]
@@ -823,6 +881,8 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    ra_attn = args.random_adapter_attn_rank or args.random_adapter_rank
+    ra_mlp = args.random_adapter_mlp_rank or args.random_adapter_rank
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -835,10 +895,17 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        ra_attn_rank=ra_attn,
+        ra_mlp_rank=ra_mlp,
+        ra_seed_base=args.random_adapter_seed_base,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
+        elif isinstance(module, RandomAdapterLinear):
+            # Keep U/V trainable params in fp32 for optimizer/state quality (mirrors CastedLinear).
+            module.U.data = module.U.data.float()
+            module.V.data = module.V.data.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
