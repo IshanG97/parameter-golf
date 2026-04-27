@@ -254,11 +254,14 @@ def gptq_quantize_weight(w,H,clip_sigmas=3.,clip_range=63,block_size=128):
 		for j in range(i2-i1):w_col=W_block[:,j];d=Hinv_block[j,j];q_col=torch.clamp(torch.round(w_col/sf),-clip_range,clip_range);Q[:,i1+j]=q_col.to(torch.int8);err=(w_col-q_col.float()*sf)/d;Err[:,j]=err;W_block[:,j:]-=err.unsqueeze(1)*Hinv_block[j,j:].unsqueeze(0)
 		if i2<cols:W_work[:,i2:]-=Err@Hinv[i1:i2,i2:]
 	return Q[:,invperm],s
+_FORCE_INT8_PT=('attn_scale','mlp_scale','resid_mix','skip_gates','skip_weights')
 def gptq_mixed_quantize(state_dict,hessians,h):
 	result={};meta={}
 	for(name,tensor)in state_dict.items():
 		t=tensor.detach().cpu().contiguous()
-		if not t.is_floating_point()or t.numel()<=65536:result[name]=t.to(torch.float16)if t.is_floating_point()else t;meta[name]='passthrough (float16)';continue
+		if not t.is_floating_point()or t.numel()<=65536:
+			if t.is_floating_point()and t.numel()>1 and any(k in name for k in _FORCE_INT8_PT):ma=t.abs().max().clamp_min(1e-10);sc=(ma/127.).float();q=torch.clamp(torch.round(t/sc),-127,127).to(torch.int8);result[name+'.q_pt']=q;result[name+'.scale_pt']=sc;meta[name]='pertensor int8 (control)';continue
+			result[name]=t.to(torch.float16)if t.is_floating_point()else t;meta[name]='passthrough (float16)';continue
 		cs=h.embed_clip_sigmas if'tok_emb'in name else h.matrix_clip_sigmas;bits=h.embed_bits if'tok_emb'in name else h.matrix_bits;q,s=gptq_quantize_weight(t,hessians[name],clip_sigmas=cs,clip_range=2**(bits-1)-1);result[name+'.q']=q;result[name+'.scale']=s;meta[name]=f"gptq (int{bits})"
 	categories=collections.defaultdict(set)
 	for(name,cat)in meta.items():short=re.sub('\\.\\d+$','',re.sub('blocks\\.\\d+','blocks',name));categories[cat].add(short)
@@ -271,6 +274,7 @@ def dequantize_mixed(result,meta,template_sd):
 		info=meta.get(name)
 		if info is None:continue
 		orig_dtype=orig.dtype
+		if'pertensor'in info:q=result[name+'.q_pt'];sc=result[name+'.scale_pt'];out[name]=(q.float()*sc.float()).to(orig_dtype);continue
 		if'passthrough'in info:
 			t=result[name]
 			if t.dtype==torch.float16 and orig_dtype in(torch.float32,torch.bfloat16):t=t.to(orig_dtype)
