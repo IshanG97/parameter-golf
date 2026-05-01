@@ -366,6 +366,33 @@ class Hyperparameters:
     lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
     lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
     lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
+    # ----- Random-adapter (port of PR #1870) -----
+    # When enabled, replace the four weight banks with
+    #   W_eff[i] = W_random(seed_i) + V_i @ U_i^T
+    # where W_random is a non-persistent buffer regenerated at runtime from a
+    # 32-bit seed (zero artefact bytes), and (U_i, V_i) are trainable rank-r
+    # adapters stored as small passthrough tensors via the existing
+    # numel<=65536 fp16 route in gptq_mixed_quantize.
+    #
+    # SCOPE controls which banks are substituted:
+    #   "mlp_only"  -> mlp_up_bank, mlp_down_bank
+    #   "attn_only" -> qo_bank, kv_bank
+    #   "all"       -> all four banks
+    #
+    # When enabled, LQER is automatically skipped on substituted layers (the
+    # residual E against a random base would just re-encode noise) because
+    # those bank slices are dropped from sd_cpu before GPTQ runs. The
+    # per-group lrzip compressor is also forced off (its _GROUP_ORDER
+    # assumes the standard banked layout). For RANDOM_ADAPTER_ENABLED=0 the
+    # entire code path is dead and behaviour is byte-identical with PR #1855.
+    random_adapter_enabled = bool(int(os.environ.get("RANDOM_ADAPTER_ENABLED", "0")))
+    random_adapter_rank = int(os.environ.get("RANDOM_ADAPTER_RANK", 2))
+    random_adapter_scope = os.environ.get("RANDOM_ADAPTER_SCOPE", "mlp_only")
+    random_adapter_seed_base = int(os.environ.get("RANDOM_ADAPTER_SEED_BASE", 42))
+    if random_adapter_enabled and random_adapter_scope not in ("mlp_only", "attn_only", "all"):
+        raise ValueError(
+            f"RANDOM_ADAPTER_SCOPE must be one of mlp_only/attn_only/all; got {random_adapter_scope}"
+        )
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1143,6 +1170,15 @@ class GPT(nn.Module):
         super().__init__()
         if h.logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {h.logit_softcap}")
+        # Random-adapter config (PR #1870 port). Stashed early because
+        # _bank_weights and the bank-Parameter construction below both branch
+        # on it. When RANDOM_ADAPTER_ENABLED=0, every branch below is dead.
+        self._ra_enabled = bool(getattr(h, "random_adapter_enabled", False))
+        self._ra_rank = int(getattr(h, "random_adapter_rank", 0))
+        self._ra_scope = str(getattr(h, "random_adapter_scope", "mlp_only"))
+        self._ra_seed_base = int(getattr(h, "random_adapter_seed_base", 42))
+        self._ra_attn_active = self._ra_enabled and self._ra_scope in ("attn_only", "all")
+        self._ra_mlp_active = self._ra_enabled and self._ra_scope in ("mlp_only", "all")
         self.tie_embeddings = h.tie_embeddings
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
@@ -1249,7 +1285,73 @@ class GPT(nn.Module):
             self.smear_gate = CastedLinear(self.smear_window, 1, bias=False)
             self.smear_gate._zero_init = True
             self.smear_lambda = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        # Random-adapter parameter buildout (PR #1870 port). Substituted bank
+        # slices keep their full-shape Parameters (so DDP and the existing
+        # state-dict roundtrip stay structurally identical) but the bank
+        # values are bypassed by _bank_weights at runtime; the actual
+        # learnable weights are these per-layer (U_i, V_i) tensors.
+        # The frozen W_random base is a non-persistent buffer (zero artefact
+        # bytes) regenerated deterministically from a seed at module init.
+        if self._ra_enabled:
+            r = self._ra_rank
+            if r <= 0:
+                raise ValueError("RANDOM_ADAPTER_RANK must be > 0 when RANDOM_ADAPTER_ENABLED=1")
+            n = h.num_layers
+            md = h.model_dim
+            head_dim_ra = h.model_dim // h.num_heads
+            kvd = h.num_kv_heads * head_dim_ra
+            hd = int(h.mlp_mult * h.model_dim)
+            self.ra_attn_U = nn.ParameterDict()
+            self.ra_attn_V = nn.ParameterDict()
+            self.ra_mlp_U = nn.ParameterDict()
+            self.ra_mlp_V = nn.ParameterDict()
+            self._ra_buffer_keys = {}  # param_dict_key -> buffer_attr_name
+            attn_slots = ("c_q", "c_k", "c_v", "proj")
+            mlp_slots = ("mlp_fc", "mlp_proj")
+            if self._ra_attn_active:
+                for i in range(n):
+                    for slot_idx, slot in enumerate(attn_slots):
+                        if slot in ("c_q", "proj"):
+                            out_d, in_d = md, md
+                        else:
+                            out_d, in_d = kvd, md
+                        key = f"l{i}_{slot}"
+                        self._ra_make(self.ra_attn_U, self.ra_attn_V, key, out_d, in_d, r,
+                                      seed=self._ra_seed_base + i * 8 + slot_idx)
+            if self._ra_mlp_active:
+                for i in range(n):
+                    for slot_idx, slot in enumerate(mlp_slots):
+                        if slot == "mlp_fc":
+                            out_d, in_d = hd, md
+                        else:
+                            out_d, in_d = md, hd
+                        key = f"l{i}_{slot}"
+                        # Offset of 4 keeps mlp seeds disjoint from attn seeds.
+                        self._ra_make(self.ra_mlp_U, self.ra_mlp_V, key, out_d, in_d, r,
+                                      seed=self._ra_seed_base + i * 8 + 4 + slot_idx)
         self._init_weights()
+
+    def _ra_make(self, u_dict, v_dict, key, out_d, in_d, rank, seed):
+        # LoRA-style init: V ~ N(0, 1/in_d), U = 0 -> step-0 forward returns
+        # the random base alone.
+        v_init = torch.randn(in_d, rank) * (in_d ** -0.5)
+        u_init = torch.zeros(rank, out_d)
+        v_dict[key] = nn.Parameter(v_init)
+        u_dict[key] = nn.Parameter(u_init)
+        g = torch.Generator(device="cpu").manual_seed(int(seed))
+        w_rand = torch.randn(out_d, in_d, generator=g) * (in_d ** -0.5)
+        # persistent=False -> never written to state_dict, costs zero artefact bytes.
+        buf_name = f"_ra_W_{key}"
+        self.register_buffer(buf_name, w_rand, persistent=False)
+        self._ra_buffer_keys[key] = buf_name
+
+    def _ra_eff_weight(self, u_dict, v_dict, key, dtype, device):
+        # Effective weight = W_random + (V @ U)^T, shape [out_d, in_d].
+        Wr = getattr(self, self._ra_buffer_keys[key]).to(device=device, dtype=dtype)
+        V = v_dict[key].to(device=device, dtype=dtype)
+        U = u_dict[key].to(device=device, dtype=dtype)
+        # V: [in,r], U: [r,out] -> (V @ U): [in,out] -> .t(): [out,in]
+        return Wr + (V @ U).t()
 
     def _init_weights(self):
         if self.tie_embeddings:
@@ -1279,14 +1381,38 @@ class GPT(nn.Module):
 
     def _bank_weights(self, i):
         n = self.num_layers
-        return (
-            self.qo_bank[i],
-            self.kv_bank[i],
-            self.kv_bank[n + i],
-            self.qo_bank[n + i],
-            self.mlp_up_bank[i],
-            self.mlp_down_bank[i],
-        )
+        if not self._ra_enabled:
+            return (
+                self.qo_bank[i],
+                self.kv_bank[i],
+                self.kv_bank[n + i],
+                self.qo_bank[n + i],
+                self.mlp_up_bank[i],
+                self.mlp_down_bank[i],
+            )
+        # Random-adapter substituted path: materialize W_random + (V @ U)^T
+        # for any in-scope slot. The bank Parameters are still kept at full
+        # shape but their values are bypassed (forward never reads them);
+        # they get dropped from sd_cpu in _unbank_state_dict before GPTQ.
+        d = self.qo_bank.device
+        dt = self.qo_bank.dtype
+        if self._ra_attn_active:
+            q_w = self._ra_eff_weight(self.ra_attn_U, self.ra_attn_V, f"l{i}_c_q", dt, d)
+            k_w = self._ra_eff_weight(self.ra_attn_U, self.ra_attn_V, f"l{i}_c_k", dt, d)
+            v_w = self._ra_eff_weight(self.ra_attn_U, self.ra_attn_V, f"l{i}_c_v", dt, d)
+            o_w = self._ra_eff_weight(self.ra_attn_U, self.ra_attn_V, f"l{i}_proj", dt, d)
+        else:
+            q_w = self.qo_bank[i]
+            k_w = self.kv_bank[i]
+            v_w = self.kv_bank[n + i]
+            o_w = self.qo_bank[n + i]
+        if self._ra_mlp_active:
+            up_w = self._ra_eff_weight(self.ra_mlp_U, self.ra_mlp_V, f"l{i}_mlp_fc", dt, d)
+            down_w = self._ra_eff_weight(self.ra_mlp_U, self.ra_mlp_V, f"l{i}_mlp_proj", dt, d)
+        else:
+            up_w = self.mlp_up_bank[i]
+            down_w = self.mlp_down_bank[i]
+        return q_w, k_w, v_w, o_w, up_w, down_w
 
     def _parallel_block(
         self, block_idx, lane0, lane1, x0,
@@ -1899,12 +2025,28 @@ PACKED_REPLICATED_GRAD_MAX_NUMEL = 1 << 15
 
 class Optimizers:
     def __init__(self, h, base_model):
-        matrix_params = [
-            base_model.qo_bank,
-            base_model.kv_bank,
-            base_model.mlp_up_bank,
-            base_model.mlp_down_bank,
-        ]
+        if getattr(base_model, "_ra_enabled", False):
+            # Random-adapter mode: substituted bank Parameters are frozen
+            # (forward bypasses them via _bank_weights), so they receive no
+            # gradient. Drop them from Muon and route the U/V adapter
+            # parameters in. Non-substituted banks still go to Muon.
+            matrix_params = []
+            if not base_model._ra_attn_active:
+                matrix_params.extend([base_model.qo_bank, base_model.kv_bank])
+            if not base_model._ra_mlp_active:
+                matrix_params.extend([base_model.mlp_up_bank, base_model.mlp_down_bank])
+            for d in (base_model.ra_attn_U, base_model.ra_attn_V,
+                      base_model.ra_mlp_U, base_model.ra_mlp_V):
+                for p in d.values():
+                    if p.ndim == 2:
+                        matrix_params.append(p)
+        else:
+            matrix_params = [
+                base_model.qo_bank,
+                base_model.kv_bank,
+                base_model.mlp_up_bank,
+                base_model.mlp_down_bank,
+            ]
         block_named_params = list(base_model.blocks.named_parameters())
         scalar_params = [
             p
@@ -2573,20 +2715,37 @@ def _deserialize_pergroup(blob, num_layers, tmpdir):
 def _unbank_state_dict(state_dict, num_layers):
     sd = {}
     n = num_layers
+    # Random-adapter signal injected by serialize() when enabled. When set,
+    # the substituted bank slices are dropped here so GPTQ never sees them
+    # (and LQER cannot pick them as candidates). The U/V tensors flow
+    # through unchanged and route via the numel<=65536 fp16 passthrough.
+    ra_meta = state_dict.get("_ra_meta")
+    drop_attn = bool(ra_meta and ra_meta.get("attn_active"))
+    drop_mlp = bool(ra_meta and ra_meta.get("mlp_active"))
     for k, v in state_dict.items():
+        if k == "_ra_meta":
+            continue
         t = v.detach().cpu() if v is not None else None
         if k == "qo_bank":
+            if drop_attn:
+                continue
             for i in range(n):
                 sd[f"blocks.{i}.attn.c_q.weight"] = t[i]
                 sd[f"blocks.{i}.attn.proj.weight"] = t[n + i]
         elif k == "kv_bank":
+            if drop_attn:
+                continue
             for i in range(n):
                 sd[f"blocks.{i}.attn.c_k.weight"] = t[i]
                 sd[f"blocks.{i}.attn.c_v.weight"] = t[n + i]
         elif k == "mlp_up_bank":
+            if drop_mlp:
+                continue
             for i in range(n):
                 sd[f"blocks.{i}.mlp.fc.weight"] = t[i]
         elif k == "mlp_down_bank":
+            if drop_mlp:
+                continue
             for i in range(n):
                 sd[f"blocks.{i}.mlp.proj.weight"] = t[i]
         else:
@@ -2598,18 +2757,33 @@ def _unbank_state_dict(state_dict, num_layers):
 def _rebank_state_dict(flat_sd, num_layers, model_dim, kv_dim, hidden_dim):
     sd = {}
     n = num_layers
-    sd["qo_bank"] = torch.zeros(2 * n, model_dim, model_dim)
-    sd["kv_bank"] = torch.zeros(2 * n, kv_dim, model_dim)
-    for i in range(n):
-        sd["qo_bank"][i] = flat_sd[f"blocks.{i}.attn.c_q.weight"]
-        sd["qo_bank"][n + i] = flat_sd[f"blocks.{i}.attn.proj.weight"]
-        sd["kv_bank"][i] = flat_sd[f"blocks.{i}.attn.c_k.weight"]
-        sd["kv_bank"][n + i] = flat_sd[f"blocks.{i}.attn.c_v.weight"]
-    sd["mlp_up_bank"] = torch.zeros(n, hidden_dim, model_dim)
-    sd["mlp_down_bank"] = torch.zeros(n, model_dim, hidden_dim)
-    for i in range(n):
-        sd["mlp_up_bank"][i] = flat_sd[f"blocks.{i}.mlp.fc.weight"]
-        sd["mlp_down_bank"][i] = flat_sd[f"blocks.{i}.mlp.proj.weight"]
+    # Random-adapter eval-side rehydration: substituted bank slices are
+    # absent from flat_sd (they were dropped pre-GPTQ). Initialise the bank
+    # Parameters as zeros so load_state_dict succeeds; forward will bypass
+    # them via _bank_weights using the runtime-regenerated W_random buffer
+    # plus the U/V Parameters loaded through the normal flat key path.
+    have_attn = "blocks.0.attn.c_q.weight" in flat_sd
+    have_mlp = "blocks.0.mlp.fc.weight" in flat_sd
+    if have_attn:
+        sd["qo_bank"] = torch.zeros(2 * n, model_dim, model_dim)
+        sd["kv_bank"] = torch.zeros(2 * n, kv_dim, model_dim)
+        for i in range(n):
+            sd["qo_bank"][i] = flat_sd[f"blocks.{i}.attn.c_q.weight"]
+            sd["qo_bank"][n + i] = flat_sd[f"blocks.{i}.attn.proj.weight"]
+            sd["kv_bank"][i] = flat_sd[f"blocks.{i}.attn.c_k.weight"]
+            sd["kv_bank"][n + i] = flat_sd[f"blocks.{i}.attn.c_v.weight"]
+    else:
+        sd["qo_bank"] = torch.zeros(2 * n, model_dim, model_dim)
+        sd["kv_bank"] = torch.zeros(2 * n, kv_dim, model_dim)
+    if have_mlp:
+        sd["mlp_up_bank"] = torch.zeros(n, hidden_dim, model_dim)
+        sd["mlp_down_bank"] = torch.zeros(n, model_dim, hidden_dim)
+        for i in range(n):
+            sd["mlp_up_bank"][i] = flat_sd[f"blocks.{i}.mlp.fc.weight"]
+            sd["mlp_down_bank"][i] = flat_sd[f"blocks.{i}.mlp.proj.weight"]
+    else:
+        sd["mlp_up_bank"] = torch.zeros(n, hidden_dim, model_dim)
+        sd["mlp_down_bank"] = torch.zeros(n, model_dim, hidden_dim)
     for k, v in flat_sd.items():
         if not (
             k.startswith("blocks.")
@@ -2650,7 +2824,20 @@ def serialize(h, base_model, code):
         log(f"Serialized model: {model_bytes} bytes")
         log(f"Code size (uncompressed): {code_bytes_uncompressed} bytes")
         log(f"Code size (compressed): {code_bytes} bytes")
-    sd_cpu = _unbank_state_dict(base_model.state_dict(), h.num_layers)
+    # Random-adapter handoff: drop substituted banks before GPTQ via the
+    # _ra_meta hint, and force brotli (per-group lrzip _GROUP_ORDER expects
+    # the standard banked GPTQ keys, which are now absent).
+    sd_full = base_model.state_dict()
+    if getattr(base_model, "_ra_enabled", False):
+        if h.compressor == "pergroup":
+            log("RandomAdapter: forcing compressor=brotli (pergroup _GROUP_ORDER incompatible)")
+            h.compressor = "brotli"
+        sd_full = dict(sd_full)
+        sd_full["_ra_meta"] = {
+            "attn_active": bool(base_model._ra_attn_active),
+            "mlp_active": bool(base_model._ra_mlp_active),
+        }
+    sd_cpu = _unbank_state_dict(sd_full, h.num_layers)
     device = torch.device("cuda", h.local_rank)
     t0 = time.perf_counter()
     calib_loader = ShuffledSequenceLoader(h, device)
