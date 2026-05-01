@@ -1009,13 +1009,13 @@ def linear_leaky_relu_square_kernel(
         if not FORWARD:
             pre0 = aux_desc.load([offs_am_c, offs_bn_c])
             pre1 = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            c0 = c0 * tl.where(pre0 > 0, 2.0 * pre0, 0.5 * pre0)
-            c1 = c1 * tl.where(pre1 > 0, 2.0 * pre1, 0.5 * pre1)
+            c0 = c0 * tl.where(pre0 > 0, 2.0 * pre0, 0.18 * pre0)
+            c1 = c1 * tl.where(pre1 > 0, 2.0 * pre1, 0.18 * pre1)
         c_desc.store([offs_am_c, offs_bn_c], c0)
         c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
         if FORWARD:
-            aux0 = tl.where(c0 > 0, c0, 0.5 * c0)
-            aux1 = tl.where(c1 > 0, c1, 0.5 * c1)
+            aux0 = tl.where(c0 > 0, c0, 0.3 * c0)
+            aux1 = tl.where(c1 > 0, c1, 0.3 * c1)
             aux_desc.store([offs_am_c, offs_bn_c], aux0 * aux0)
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], aux1 * aux1)
 
@@ -1274,7 +1274,7 @@ class MLP(nn.Module):
     def forward(self, x, up_w, down_w):
         if self.training and self.use_fused:
             return FusedLeakyReLUSquareMLP(x, up_w.to(x.dtype), down_w.to(x.dtype))
-        hidden = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5).square()
+        hidden = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.3).square()
         self._last_down_input = hidden.detach() if getattr(self, "_calib", False) else None
         return F.linear(hidden, down_w.to(x.dtype))
 
