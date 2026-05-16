@@ -5,7 +5,7 @@
 vs current leaderboard SOTA (PR #1855, val_bpb 1.06108): **+0.00032 BPB** (slightly worse, not a record).
 
 Submitted as **non-record** to contribute three findings:
-1. **Hardware calibration data** — confirms PR #1981's "calibration offset" finding at smaller magnitude (+1.25 mbpb on our hardware vs SOTA's reported numbers, vs PR #1981's claimed ~5 mbpb).
+1. **Hardware calibration data** — confirms PR #1983's "calibration offset" finding at smaller magnitude (+1.25 mbpb on our hardware vs SOTA's reported numbers, vs PR #1983's claimed ~5 mbpb).
 2. **SWA composition with PR #1855's full stack** — small but real improvement (~0.9 mbpb vs vanilla on the same hardware), composes cleanly with LQER asymmetric int4 + per-group lrzip pipeline.
 3. **Reproducibility checkpoint** — independent 3-seed reproduction within ±0.4 mbpb of published numbers per seed.
 
@@ -30,7 +30,7 @@ To isolate hardware shift from method effect, we ran PR #1855 *byte-identical* (
 | PR #1855 published seed=42 | 1.05989 | 15,897,259 | 509 s |
 | **Hardware shift** | **+1.25 mbpb** | +9,507 bytes | +23 s |
 
-This confirms PR #1981's observation that the same code on different hardware does not produce identical BPB, but at much smaller magnitude (~1 mbpb) than PR #1981's claimed ~5 mbpb.
+This confirms PR #1983's observation that the same code on different hardware does not produce identical BPB, but at much smaller magnitude (~1 mbpb) than PR #1983's claimed ~5 mbpb.
 
 ## SWA addition vs vanilla on same hardware
 
